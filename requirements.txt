@@ -1,0 +1,8 @@
+pyrofork
+tgcrypto
+yt-dlp
+motor
+opencv-python-headless
+numpy
+Pillow
+requests

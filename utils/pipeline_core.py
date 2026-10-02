@@ -1,0 +1,447 @@
+# Core logic for the download -> watermark -> upload pipeline (no Telegram code in here,
+# so it can be tested on its own).
+import asyncio
+import base64
+import io
+import json
+import math
+import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+from datetime import datetime
+from urllib.parse import urlparse
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, features
+import yt_dlp
+
+FFMPEG = os.getenv("FFMPEG_PATH", "ffmpeg")
+FFPROBE = os.getenv("FFPROBE_PATH", "ffprobe")
+PRESET = os.getenv("FFMPEG_PRESET", "veryfast")
+CRF = os.getenv("FFMPEG_CRF", "23")
+MAX_TG_BYTES = int(float(os.getenv("TG_MAX_MB", "1950")) * 1024 * 1024)
+
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORK_DIR = os.getenv("WORK_DIR", os.path.join(_BASE, "work"))
+BUNDLED_FONT = os.path.join(_BASE, "assets", "fonts", "DejaVuSans-Bold.ttf")
+
+DEFAULTS = {
+    "wm_mode": "off",          # off | text | logo | both
+    "wm_text": "",
+    "wm_logo_b64": "",
+    "wm_pos": "br",            # tl | tr | bl | br | c
+    "wm_size": 10,             # watermark width as % of video width
+    "wm_opacity": 50,          # 10..100
+    "caption_tpl": "🎬 **{title}**\n⏱ {duration} · 🎞 {res}",
+    "title_tpl": "{title}",
+    "desc_tpl": "",
+    "yt_privacy": "unlisted",
+    "fwd_chat": "",
+    "thumb_b64": "",
+    "next_n": 1,
+    "referer": "",
+}
+
+PLACEHOLDERS = ["title", "n", "date", "time", "duration", "res", "source", "uploader",
+                "filename", "filesize", "yt", "yt_title", "slide", "url"]
+
+
+def have_ffmpeg():
+    return shutil.which(FFMPEG) is not None and shutil.which(FFPROBE) is not None
+
+
+# ------------------------------------------------------------------ formatting
+def fmt_duration(sec):
+    sec = int(sec or 0)
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def fmt_size(b):
+    b = float(b or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024 or unit == "GB":
+            return f"{b:.0f} {unit}" if unit == "B" else f"{b:.1f} {unit}"
+        b /= 1024
+
+
+def fmt_eta(sec):
+    if sec is None or sec < 0:
+        return "--"
+    return fmt_duration(sec)
+
+
+def bar(pct, n=10):
+    pct = max(0.0, min(100.0, float(pct or 0)))
+    full = int(round(n * pct / 100))
+    return "█" * full + "░" * (n - full)
+
+
+_ph_re = re.compile(r"\{(\w+)\}")
+
+
+def sanitize_value(v):
+    """Remove characters that would break Telegram's markdown in captions."""
+    return re.sub(r"[*_`~|\[\]<>]", " ", str(v)).strip()
+
+
+def render_template(tpl, values):
+    """Fill {placeholders}. Lines whose placeholders are all empty are dropped
+    (so '🔗 YouTube: {yt}' disappears when there is no YouTube link)."""
+    out = []
+    for line in (tpl or "").split("\n"):
+        names = [n for n in _ph_re.findall(line) if n in PLACEHOLDERS]
+        if names and all(not str(values.get(n, "")).strip() for n in names):
+            continue
+        out.append(_ph_re.sub(
+            lambda m: sanitize_value(values.get(m.group(1), "")) if m.group(1) in PLACEHOLDERS else m.group(0),
+            line))
+    return "\n".join(out).strip()
+
+
+_WEAK_TITLES = {"", "playlist", "video", "index", "master", "stream", "untitled", "media", "video.m3u8",
+                "playlist.m3u8", "index.m3u8", "master.m3u8"}
+
+
+def is_weak_title(t):
+    t = (t or "").strip().lower()
+    return t in _WEAK_TITLES or bool(re.fullmatch(r"[0-9a-f\-]{24,}", t)) or t.endswith(".m3u8")
+
+
+def sanitize_filename(name, maxlen=100):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return (name or "video")[:maxlen]
+
+
+def source_name(url, extractor=None):
+    if extractor and extractor.lower() not in ("generic", "hlsplaylist"):
+        return extractor
+    return urlparse(url).netloc or "web"
+
+
+# ------------------------------------------------------------------ images (watermark / thumbnail)
+def _font_candidates(has_bengali):
+    c = []
+    if has_bengali:
+        c += [r"C:\Windows\Fonts\Nirmala.ttf", r"C:\Windows\Fonts\NirmalaB.ttf",
+              "/usr/share/fonts/truetype/noto/NotoSansBengali-Bold.ttf",
+              "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
+              "/Library/Fonts/Arial Unicode.ttf"]
+    c += [BUNDLED_FONT, r"C:\Windows\Fonts\arialbd.ttf",
+          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    return [p for p in c if os.path.exists(p)]
+
+
+def bengali_ok():
+    """Bengali text needs a Bengali font AND libraqm for correct conjunct shaping."""
+    return bool(features.check("raqm")) and any("engali" in p or "Nirmala" in p
+                                                 for p in _font_candidates(True))
+
+
+def render_text_image(text):
+    has_bn = any("\u0980" <= ch <= "\u09ff" for ch in text)
+    paths = _font_candidates(has_bn)
+    font = ImageFont.truetype(paths[0], 160) if paths else ImageFont.load_default()
+    stroke = 7
+    dummy = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    box = dummy.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    w, h = box[2] - box[0] + 2 * stroke, box[3] - box[1] + 2 * stroke
+    img = Image.new("RGBA", (max(w, 1), max(h, 1)), (0, 0, 0, 0))
+    ImageDraw.Draw(img).text((stroke - box[0], stroke - box[1]), text, font=font,
+                             fill=(255, 255, 255, 255), stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+    return img
+
+
+def build_watermark_image(mode, text, logo_bytes, target_w, opacity):
+    """Return an RGBA PIL image `target_w` px wide, or None if nothing to draw."""
+    parts = []
+    if mode in ("text", "both") and (text or "").strip():
+        parts.append(render_text_image(text.strip()))
+    if mode in ("logo", "both") and logo_bytes:
+        parts.append(Image.open(io.BytesIO(logo_bytes)).convert("RGBA"))
+    if not parts:
+        return None
+    if len(parts) == 2:                       # logo (left) + text (right), same height
+        txt, logo = parts[0], parts[1]
+        h = max(txt.height, 1)
+        logo = logo.resize((max(1, int(logo.width * h * 1.4 / logo.height)), int(h * 1.4)), Image.LANCZOS)
+        gap = int(h * 0.3)
+        canvas = Image.new("RGBA", (logo.width + gap + txt.width, max(logo.height, txt.height)), (0, 0, 0, 0))
+        canvas.paste(logo, (0, (canvas.height - logo.height) // 2), logo)
+        canvas.paste(txt, (logo.width + gap, (canvas.height - txt.height) // 2), txt)
+        img = canvas
+    else:
+        img = parts[0]
+    target_w = max(16, int(target_w))
+    img = img.resize((target_w, max(1, int(img.height * target_w / img.width))), Image.LANCZOS)
+    a = img.getchannel("A").point(lambda v: int(v * max(0, min(100, opacity)) / 100))
+    img.putalpha(a)
+    return img
+
+
+def wm_xy(pos, W, H, w, h):
+    m = max(8, int(W * 0.02))
+    return {"tl": (m, m), "tr": (W - w - m, m), "bl": (m, H - h - m),
+            "br": (W - w - m, H - h - m), "c": ((W - w) // 2, (H - h) // 2)}.get(pos, (W - w - m, H - h - m))
+
+
+def process_logo_upload(raw):
+    """Normalise an uploaded logo to a PNG (max 800px), return base64 str."""
+    arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+    if arr is None:
+        raise ValueError("Not a valid image")
+    h, w = arr.shape[:2]
+    s = 800 / max(h, w)
+    if s < 1:
+        arr = cv2.resize(arr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".png", arr)
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+def process_thumb_bytes(raw):
+    """Telegram thumbnails: JPEG, max 320px, < 200 KB."""
+    arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        raise ValueError("Not a valid image")
+    h, w = arr.shape[:2]
+    s = 320 / max(h, w)
+    if s < 1:
+        arr = cv2.resize(arr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    for q in (88, 75, 60, 45):
+        ok, buf = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, q])
+        if len(buf) < 195 * 1024:
+            break
+    return buf.tobytes()
+
+
+# ------------------------------------------------------------------ ffmpeg / ffprobe
+async def probe_file(path):
+    proc = await asyncio.create_subprocess_exec(
+        FFPROBE, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    data = json.loads(out or b"{}")
+    v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    fmt = data.get("format", {})
+    dur = float(fmt.get("duration") or v.get("duration") or 0)
+    return {"width": int(v.get("width") or 0), "height": int(v.get("height") or 0),
+            "duration": dur, "size": int(fmt.get("size") or os.path.getsize(path))}
+
+
+async def run_ffmpeg(cmd, duration, on_progress=None, cancel_ev=None):
+    """Run ffmpeg with -progress pipe:1 and report 0..100. Returns (returncode, stderr_text)."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    err_task = asyncio.create_task(proc.stderr.read())
+    while True:
+        if cancel_ev is not None and cancel_ev.is_set():
+            proc.kill()
+            break
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=2)
+        except asyncio.TimeoutError:
+            continue
+        if not line:
+            break
+        line = line.decode(errors="ignore").strip()
+        if line.startswith(("out_time_us=", "out_time_ms=")) and duration and on_progress:
+            try:
+                t = int(line.split("=", 1)[1]) / 1_000_000
+                on_progress(min(100.0, t * 100 / duration))
+            except ValueError:
+                pass
+    await proc.wait()
+    err = (await err_task).decode(errors="ignore")
+    return proc.returncode, err
+
+
+async def watermark_video(src, dst, wm_png, x, y, duration, on_progress=None, cancel_ev=None):
+    base = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", src, "-i", wm_png,
+            "-filter_complex", f"[0:v][1:v]overlay={x}:{y}:format=auto,format=yuv420p[v]",
+            "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", PRESET, "-crf", CRF]
+    tail = ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", dst]
+    rc, err = await run_ffmpeg(base + ["-c:a", "copy"] + tail, duration, on_progress, cancel_ev)
+    if rc != 0 and not (cancel_ev and cancel_ev.is_set()):
+        rc, err = await run_ffmpeg(base + ["-c:a", "aac", "-b:a", "128k"] + tail, duration, on_progress, cancel_ev)
+    if rc != 0:
+        raise RuntimeError("ffmpeg watermark failed: " + err[-300:])
+
+
+async def make_thumbnail(src, out_jpg, duration, custom_bytes=None):
+    if custom_bytes:
+        with open(out_jpg, "wb") as f:
+            f.write(process_thumb_bytes(custom_bytes))
+        return out_jpg
+    at = max(1, int((duration or 20) * 0.1))
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-ss", str(at), "-i", src,
+        "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", out_jpg,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    await proc.wait()
+    if os.path.exists(out_jpg):
+        with open(out_jpg, "rb") as f:
+            data = f.read()
+        with open(out_jpg, "wb") as f:
+            f.write(process_thumb_bytes(data))
+        return out_jpg
+    return None
+
+
+async def split_video(src, outdir, duration, max_bytes=None, cancel_ev=None):
+    """Split into parts under max_bytes (stream copy). Returns a list of file paths."""
+    max_bytes = max_bytes or MAX_TG_BYTES
+    size = os.path.getsize(src)
+    if size <= max_bytes:
+        return [src]
+    n = math.ceil(size / (max_bytes * 0.92))
+    for _ in range(4):
+        pattern = os.path.join(outdir, "part%03d.mp4")
+        for old in os.listdir(outdir):
+            if old.startswith("part") and old.endswith(".mp4"):
+                os.remove(os.path.join(outdir, old))
+        seg = max(5, duration / n)
+        rc, err = await run_ffmpeg(
+            [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", src, "-map", "0", "-c", "copy",
+             "-f", "segment", "-segment_time", f"{seg:.2f}", "-reset_timestamps", "1",
+             "-segment_format", "mp4", "-segment_format_options", "movflags=+faststart",
+             "-progress", "pipe:1", "-nostats", pattern], duration, None, cancel_ev)
+        if rc != 0:
+            raise RuntimeError("ffmpeg split failed: " + err[-300:])
+        parts = sorted(os.path.join(outdir, f) for f in os.listdir(outdir)
+                       if f.startswith("part") and f.endswith(".mp4"))
+        if parts and all(os.path.getsize(p) <= max_bytes for p in parts):
+            return parts
+        n += 1
+    raise RuntimeError("Could not split the video into small enough parts")
+
+
+# ------------------------------------------------------------------ yt-dlp
+class _SilentLogger:
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
+def _headers(referer):
+    h = {}
+    if referer:
+        h["Referer"] = referer
+        p = urlparse(referer)
+        if p.scheme and p.netloc:
+            h["Origin"] = f"{p.scheme}://{p.netloc}"
+    return h
+
+
+def _valid_cookie_lines(text):
+    return [l for l in (text or "").splitlines() if l.strip() and not l.lstrip().startswith("#")
+            and len(l.split(None, 6)) >= 7]
+
+
+def make_cookie_file(name=None):
+    """Return the path of a TEMP Netscape-format cookie file, or None when no valid cookies exist.
+    Sources (first valid wins): config value `name` (YT_COOKIES / INSTA_COOKIES), then a
+    cookies.txt in the project folder (or COOKIES_FILE=...). Temp copy => your original is never modified."""
+    text = ""
+    if name:
+        try:
+            import config as _cfg
+            text = getattr(_cfg, name, "") or ""
+        except Exception:
+            text = ""
+    if not _valid_cookie_lines(text):
+        for cand in (os.getenv("COOKIES_FILE", ""), os.path.join(_BASE, "cookies.txt"), "cookies.txt"):
+            if cand and os.path.isfile(cand):
+                with open(cand, encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+                if _valid_cookie_lines(text):
+                    break
+    lines = _valid_cookie_lines(text)
+    if not lines:
+        return None
+    body = "\n".join("\t".join(l.split(None, 6)) for l in lines)       # spaces -> tabs (env vars lose tabs)
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ck_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("# Netscape HTTP Cookie File\n" + body + "\n")
+    return path
+
+
+def probe_url_sync(url, referer=""):
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "http_headers": _headers(referer),
+            "skip_download": True, "logger": _SilentLogger()}
+    ck = make_cookie_file()
+    if ck:
+        opts["cookiefile"] = ck
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    finally:
+        if ck and os.path.exists(ck):
+            os.remove(ck)
+    if info.get("_type") == "playlist" and info.get("entries"):
+        info = info["entries"][0]
+    heights = sorted({int(f["height"]) for f in info.get("formats", []) if f.get("height")}, reverse=True)
+    return {"title": info.get("title") or "", "duration": info.get("duration") or 0,
+            "uploader": info.get("uploader") or info.get("channel") or "",
+            "source": source_name(url, info.get("extractor_key")), "heights": heights}
+
+
+def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
+    """Blocking download (run in a thread). Returns the path of the downloaded file."""
+    if quality == "best":
+        fmt = "bv*+ba/b"
+    else:
+        h = int(quality)
+        fmt = f"bv*[height<={h}]+ba/b[height<={h}]/b"
+
+    def hook(d):
+        if cancel_ev.is_set():
+            raise yt_dlp.utils.DownloadCancelled()
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            pct = (done * 100 / total) if total else 0
+            if not total and d.get("fragment_count"):
+                pct = (d.get("fragment_index") or 0) * 100 / d["fragment_count"]
+            on_progress(pct, d.get("speed"), d.get("eta"))
+
+    opts = {"format": fmt, "outtmpl": os.path.join(outdir, "src.%(ext)s"), "merge_output_format": "mp4",
+            "noplaylist": True, "quiet": True, "no_warnings": True, "noprogress": True, "retries": 5, "fragment_retries": 10,
+            "concurrent_fragment_downloads": 4, "logger": _SilentLogger(), "progress_hooks": [hook], "http_headers": _headers(referer)}
+    if os.path.dirname(shutil.which(FFMPEG) or ""):
+        opts["ffmpeg_location"] = os.path.dirname(shutil.which(FFMPEG))
+    ck = make_cookie_file()
+    if ck:
+        opts["cookiefile"] = ck
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+    finally:
+        if ck and os.path.exists(ck):
+            os.remove(ck)
+    files = [os.path.join(outdir, f) for f in os.listdir(outdir) if f.startswith("src.")
+             and not f.endswith((".part", ".ytdl"))]
+    if not files:
+        raise RuntimeError("Download finished but no file was found")
+    return max(files, key=os.path.getsize)
+
+
+def cleanup_stale(max_age_hours=24):
+    if not os.path.isdir(WORK_DIR):
+        return
+    for d in os.listdir(WORK_DIR):
+        p = os.path.join(WORK_DIR, d)
+        try:
+            if time.time() - os.path.getmtime(p) > max_age_hours * 3600:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
