@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 STAGE = {"prepare": "🔎 Preparing…", "download": "📥 Downloading file…", "encode": "🎨 Adding watermark…",
          "convert": "🎧 Converting to MP3…", "split": "✂️ Splitting (file is over 2 GB)…",
-         "upload": "📤 Uploading to Telegram…", "queued": "⏳ Queued"}
+         "upload": "📤 Uploading to Telegram…", "yt": "▶️ Uploading to YouTube…", "queued": "⏳ Queued"}
 BRAND = os.getenv("BRAND_NAME") or "NexTGSF"
 
 
@@ -30,10 +30,12 @@ class JobCancelled(Exception):
 
 
 class Job:
-    def __init__(self, uid, chat_id, links, quality, wm_on, msg=None, job_id=None, msg_id=None):
+    def __init__(self, uid, chat_id, links, quality, wm_on, msg=None, job_id=None, msg_id=None, opts=None):
         self.id = job_id or uuid.uuid4().hex[:10]
         self.uid, self.chat_id, self.links = uid, chat_id, [tuple(x) for x in links]
         self.quality, self.wm_on, self.msg = quality, wm_on, msg
+        self.opts = opts or {}
+        self.outputs = []          # extra result lines, e.g. YouTube links
         self.msg_id = msg_id or getattr(msg, "id", None)
         self.cancel = threading.Event()
         self.idx, self.total = 0, len(self.links)
@@ -43,12 +45,12 @@ class Job:
 
     def to_doc(self):
         return {"_id": self.id, "uid": self.uid, "chat_id": self.chat_id, "msg_id": self.msg_id,
-                "links": [list(x) for x in self.links], "quality": self.quality, "wm_on": self.wm_on}
+                "links": [list(x) for x in self.links], "quality": self.quality, "wm_on": self.wm_on, "opts": self.opts}
 
     @classmethod
     def from_doc(cls, d):
         return cls(d["uid"], d["chat_id"], d["links"], d["quality"], d["wm_on"],
-                   job_id=d["_id"], msg_id=d.get("msg_id"))
+                   job_id=d["_id"], msg_id=d.get("msg_id"), opts=d.get("opts"))
 
 
 # ------------------------------------------------------------ settings helpers (shared)
@@ -130,6 +132,46 @@ async def run_cancellable(job, fn, *args):
             raise JobCancelled()
 
 
+def fwd_targets(job, cfg):
+    mode = (job.opts or {}).get("fwd_mode", "default")
+    if mode == "none":
+        return []
+    if mode == "custom":
+        return [int(x) for x in (job.opts.get("fwd") or [])]
+    return [int(cfg["fwd_chat"])] if cfg.get("fwd_chat") else []
+
+
+async def forward_all(ctx, job, cfg, sent):
+    """Copy the delivered message to every chosen group/channel."""
+    for t in fwd_targets(job, cfg):
+        try:
+            await ctx.client.copy_message(t, job.chat_id, sent.id)
+        except Exception as e:
+            note = f"Forward to {t} failed ({str(e)[:70]})"
+            if note not in job.notes:
+                job.notes.append(note)
+
+
+def yt_upload_sync(cfg, path, title, desc, privacy, thumb, on_pct, cancel_ev):
+    """Blocking: upload to the user's connected YouTube channel. Returns (video_id, note)."""
+    from utils import youtube_api as ya
+    from utils.encrypt import dcs
+    if not ya.configured():
+        raise RuntimeError("YouTube is not set up on the server (YT_CLIENT_ID / YT_CLIENT_SECRET missing)")
+    if not cfg.get("yt_refresh"):
+        raise RuntimeError("YouTube is not connected. Send /ytconnect first")
+    refresh = dcs(cfg["yt_refresh"])
+    get_token = lambda: ya.refresh_access_token(refresh)[0]          # noqa: E731
+    vid = ya.upload_video(get_token, path, title, desc, privacy, on_progress=on_pct, cancel_ev=cancel_ev)
+    note = ""
+    if thumb and os.path.exists(thumb):
+        try:
+            ya.set_thumbnail(get_token(), vid, thumb)
+        except Exception as e:
+            note = f"YouTube thumbnail not set ({str(e)[:60]})"
+    return vid, note
+
+
 # ------------------------------------------------------------ one video
 async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb, wm_active):
     loop = asyncio.get_running_loop()
@@ -154,9 +196,18 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
             raise
         except Exception:
             info = {"title": "", "duration": 0, "uploader": "", "source": urlparse(url).netloc, "heights": []}
-        raw_title = title_override or info["title"]
-        if pc.is_weak_title(raw_title):
-            raw_title = f"Class {n}"
+        o = job.opts or {}
+        tm = o.get("title_mode", "fetched")
+        if tm == "custom" and (o.get("title") or "").strip():
+            raw_title = o["title"].strip() + (f" {job.idx}" if job.total > 1 else "")
+        elif tm == "skip":
+            raw_title = f"{'yt video' if pc.is_youtube(url) else 'video'} {datetime.now().strftime('%d%m%Y')}"
+            if job.total > 1:
+                raw_title += f" {job.idx}"
+        else:
+            raw_title = title_override or info["title"]
+            if pc.is_weak_title(raw_title):
+                raw_title = f"Class {n}"
         job.title = raw_title
 
         # ---- download
@@ -206,17 +257,45 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
         vals = {"title": raw_title, "n": n, "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S"),
                 "duration": pc.fmt_duration(meta["duration"]), "res": f"{meta['height']}p",
                 "source": info["source"], "uploader": info["uploader"], "url": url,
-                "yt": "", "yt_title": "", "slide": ""}
+                "yt": "", "yt_title": "", "slide": o.get("slide", "")}
         final_title = pc.render_template(cfg["title_tpl"], vals) or raw_title
         filename = pc.sanitize_filename(final_title) + ".mp4"
         final_path = os.path.join(workdir, filename)
         os.replace(path, final_path)
         vals.update(title=final_title, filename=filename, filesize=pc.fmt_size(os.path.getsize(final_path)))
-        caption = pc.render_template(cfg["caption_tpl"], vals)
         job.title = final_title
 
-        # ---- thumbnail + split
+        # ---- thumbnail
         thumb = await pc.make_thumbnail(final_path, os.path.join(workdir, "thumb.jpg"), meta["duration"], custom_thumb)
+
+        # ---- YouTube (optional)
+        dest = o.get("dest", "tg")
+        if dest in ("yt", "both"):
+            set_stage(job, "yt")
+
+            def yt_pct(pct):
+                job.pct = pct
+
+            desc = pc.render_template(cfg["desc_tpl"], vals) if cfg.get("desc_tpl") else ""
+            if vals["slide"] and "{slide}" not in (cfg.get("desc_tpl") or ""):
+                desc = (desc + "\n\n" if desc else "") + f"Slide: {vals['slide']}"
+            vid, ynote = await run_cancellable(job, yt_upload_sync, cfg, final_path, final_title, desc,
+                                               cfg["yt_privacy"], thumb, yt_pct, job.cancel)
+            vals.update(yt=f"https://youtu.be/{vid}", yt_title=final_title)
+            job.outputs.append(f"▶️ YouTube: https://youtu.be/{vid} ({cfg['yt_privacy']})")
+            if ynote:
+                job.notes.append(ynote)
+
+        caption_tpl = cfg["caption_tpl"]
+        if vals["slide"] and "{slide}" not in caption_tpl:
+            caption_tpl += "\n📎 Slide: {slide}"
+        if vals["yt"] and "{yt}" not in caption_tpl:
+            caption_tpl += "\n▶️ {yt}"
+        caption = pc.render_template(caption_tpl, vals)
+        if dest == "yt":
+            return                                   # YouTube only: nothing to send to Telegram
+
+        # ---- split
         if os.path.getsize(final_path) > pc.MAX_TG_BYTES:
             set_stage(job, "split")
             parts = await pc.split_video(final_path, workdir, meta["duration"], cancel_ev=job.cancel)
@@ -247,13 +326,7 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
                 if job.cancel.is_set():
                     raise JobCancelled()
                 raise RuntimeError(f"Upload failed: {str(e)[:150]}")
-            if cfg["fwd_chat"]:
-                try:
-                    await ctx.client.send_video(int(cfg["fwd_chat"]), sent.video.file_id, caption=cap[:1024])
-                except Exception as e:
-                    note = f"Auto-forward failed ({str(e)[:80]})"
-                    if note not in job.notes:
-                        job.notes.append(note)
+            await forward_all(ctx, job, cfg, sent)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -291,13 +364,7 @@ async def process_audio(job, ctx, cfg, n, url, raw_title, info, src, meta, kbps,
         if job.cancel.is_set():
             raise JobCancelled()
         raise RuntimeError(f"Upload failed: {str(e)[:150]}")
-    if cfg["fwd_chat"]:
-        try:
-            await ctx.client.send_audio(int(cfg["fwd_chat"]), sent.audio.file_id, caption=cap)
-        except Exception as e:
-            note = f"Auto-forward failed ({str(e)[:80]})"
-            if note not in job.notes:
-                job.notes.append(note)
+    await forward_all(ctx, job, cfg, sent)
 
 
 # ------------------------------------------------------------ a whole batch
@@ -305,10 +372,23 @@ async def run_job(job, ctx):
     if job.cancel.is_set():
         await ctx.edit(job, "⏹ Cancelled.", final=True)
         return
-    cfg = await ctx.get_cfg(job.uid)
+    cfg = dict(await ctx.get_cfg(job.uid))
+    o = job.opts or {}
     logo = base64.b64decode(cfg["wm_logo_b64"]) if cfg["wm_logo_b64"] else None
     custom_thumb = base64.b64decode(cfg["thumb_b64"]) if cfg["thumb_b64"] else None
     wm_active = job.wm_on and wm_ready(cfg)
+    wmo = o.get("wm") or {}
+    if wmo.get("mode") == "skip":
+        wm_active = False
+    elif wmo.get("mode") == "custom" and wmo.get("logo_b64"):
+        logo = base64.b64decode(wmo["logo_b64"])
+        cfg.update(wm_mode="logo", wm_text="", wm_size=int(wmo.get("size", 15)),
+                   wm_opacity=int(wmo.get("opacity", 70)), wm_pos=wmo.get("pos", "dr"))
+        wm_active = True
+    if o.get("thumb") == "skip":
+        custom_thumb = None
+    elif o.get("thumb") == "custom" and o.get("thumb_b64"):
+        custom_thumb = base64.b64decode(o["thumb_b64"])
     n = int(cfg["next_n"])
     stats = getattr(ctx, "stats", None)
     updater = asyncio.create_task(progress_loop(job, ctx))
@@ -341,7 +421,9 @@ async def run_job(job, ctx):
     if cancelled:
         text = f"⏹ Cancelled. {job.ok} video(s) were already sent."
     else:
-        text = f"🎉 Batch complete!\n✅ Sent: {job.ok}\n❌ Failed: {len(job.fail)}"
+        text = f"🎉 Task complete!\n✅ Done: {job.ok}\n❌ Failed: {len(job.fail)}"
+        for line in job.outputs:
+            text += f"\n{line}"
         for u, why in job.fail[:5]:
             text += f"\n• {u[:60]}… — {why}"
         if any("403" in w or "orbidden" in w for _, w in job.fail):

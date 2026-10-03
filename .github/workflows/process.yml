@@ -36,5 +36,7 @@ jobs:
           MASTER_KEY: ${{ secrets.MASTER_KEY }}
           IV_KEY: ${{ secrets.IV_KEY }}
           DB_NAME: ${{ secrets.DB_NAME }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           FFMPEG_PRESET: veryfast
         run: python worker.py "${{ inputs.job_id }}"

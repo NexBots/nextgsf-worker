@@ -6,3 +6,4 @@ opencv-python-headless
 numpy
 Pillow
 requests
+cryptography

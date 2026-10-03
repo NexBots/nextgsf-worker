@@ -34,7 +34,7 @@ DEFAULTS = {
     "wm_mode": "off",          # off | text | logo | both
     "wm_text": "",
     "wm_logo_b64": "",
-    "wm_pos": "br",            # tl | tr | bl | br | c
+    "wm_pos": "dr",            # ul uc ur cl cc cr dl dc dr
     "wm_size": 10,             # watermark width as % of video width
     "wm_opacity": 50,          # 10..100
     "caption_tpl": "🎬 **{title}**\n⏱ {duration} · 🎞 {res}",
@@ -46,6 +46,9 @@ DEFAULTS = {
     "next_n": 1,
     "referer": "",
     "referer_map": {},
+    "fsets": [],               # forward sets: [{"name": str, "chats": [chat_id, ...]}]
+    "yt_refresh": "",          # encrypted YouTube refresh token
+    "yt_channel": "",
 }
 
 PLACEHOLDERS = ["title", "n", "date", "time", "duration", "res", "source", "uploader",
@@ -191,9 +194,14 @@ def build_watermark_image(mode, text, logo_bytes, target_w, opacity):
 
 
 def wm_xy(pos, W, H, w, h):
+    """pos: ul uc ur / cl cc cr / dl dc dr  (U=up, C=centre, D=down; L, C, R).  Old tl/tr/bl/br/c still work."""
+    pos = {"tl": "ul", "tr": "ur", "bl": "dl", "br": "dr", "c": "cc"}.get(pos, pos)
+    if len(pos) != 2 or pos[0] not in "ucd" or pos[1] not in "lcr":
+        pos = "dr"
     m = max(8, int(W * 0.02))
-    return {"tl": (m, m), "tr": (W - w - m, m), "bl": (m, H - h - m),
-            "br": (W - w - m, H - h - m), "c": ((W - w) // 2, (H - h) // 2)}.get(pos, (W - w - m, H - h - m))
+    x = {"l": m, "c": (W - w) // 2, "r": W - w - m}[pos[1]]
+    y = {"u": m, "c": (H - h) // 2, "d": H - h - m}[pos[0]]
+    return x, y
 
 
 def process_logo_upload(raw):
@@ -498,3 +506,20 @@ def cleanup_stale(max_age_hours=24):
                 shutil.rmtree(p, ignore_errors=True)
         except OSError:
             pass
+
+
+def is_youtube(url):
+    h = urlparse(url).netloc.lower()
+    return any(h == d or h.endswith("." + d) for d in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+
+
+def link_kind(url):
+    """Short label shown in 'link detected': YouTube / HLS stream / Direct file / Web page."""
+    path = urlparse(url).path.lower()
+    if is_youtube(url):
+        return "YouTube"
+    if path.endswith(".m3u8") or ".m3u8" in url.lower():
+        return "HLS stream (m3u8)"
+    if path.endswith((".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".mp3", ".m4a")):
+        return "Direct file"
+    return "Web video"
