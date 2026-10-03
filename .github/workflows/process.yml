@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: "Job id"
+        description: "Job id (details are stored in the database, not here)"
         required: true
 
 jobs:
@@ -13,16 +13,20 @@ jobs:
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
       - name: Install ffmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
+
       - name: Install Python packages
         run: pip install -q -r requirements.txt
+
       - name: Run job
         env:
           API_ID: ${{ secrets.API_ID }}

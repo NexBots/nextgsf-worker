@@ -117,6 +117,19 @@ async def progress_loop(job, ctx, every=4):
         await asyncio.sleep(every)
 
 
+async def run_cancellable(job, fn, *args):
+    """Run a blocking function in a thread but give up at once when the user presses Cancel."""
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, fn, *args)
+    fut.add_done_callback(lambda f: f.cancelled() or f.exception())     # silence 'never retrieved'
+    while True:
+        done, _ = await asyncio.wait({fut}, timeout=1)
+        if done:
+            return fut.result()
+        if job.cancel.is_set():
+            raise JobCancelled()
+
+
 # ------------------------------------------------------------ one video
 async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb, wm_active):
     loop = asyncio.get_running_loop()
@@ -126,8 +139,19 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
     os.makedirs(workdir, exist_ok=True)
     try:
         set_stage(job, "prepare")
+        learned = dict(cfg.get("referer_map") or {})
+        host = urlparse(url).netloc.lower()
+        ref, worked = await run_cancellable(job, pc.pick_referer, url, cfg["referer"], learned)
+        if worked and ref and learned.get(host.replace(".", "|")) != ref:
+            learned[host.replace(".", "|")] = ref
+            try:
+                await ctx.set_cfg(job.uid, referer_map=learned)
+            except Exception:
+                pass
         try:
-            info = await loop.run_in_executor(None, pc.probe_url_sync, url, cfg["referer"])
+            info = await run_cancellable(job, pc.probe_url_sync, url, ref)
+        except JobCancelled:
+            raise
         except Exception:
             info = {"title": "", "duration": 0, "uploader": "", "source": urlparse(url).netloc, "heights": []}
         raw_title = title_override or info["title"]
@@ -142,8 +166,10 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
             job.pct, job.speed, job.eta, job.done_b, job.total_b = pct, speed, eta, done, total
 
         try:
-            path = await loop.run_in_executor(None, pc.download_sync, url, workdir,
-                                              "audio" if audio else job.quality, cfg["referer"], dl_cb, job.cancel)
+            path = await run_cancellable(job, pc.download_sync, url, workdir,
+                                         "audio" if audio else job.quality, ref, dl_cb, job.cancel)
+        except JobCancelled:
+            raise
         except Exception as e:
             if job.cancel.is_set():
                 raise JobCancelled()

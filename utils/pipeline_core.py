@@ -45,6 +45,7 @@ DEFAULTS = {
     "thumb_b64": "",
     "next_n": 1,
     "referer": "",
+    "referer_map": {},
 }
 
 PLACEHOLDERS = ["title", "n", "date", "time", "duration", "res", "source", "uploader",
@@ -342,7 +343,7 @@ class _SilentLogger:
 
 
 def _headers(referer):
-    h = {}
+    h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
     if referer:
         h["Referer"] = referer
         p = urlparse(referer)
@@ -382,6 +383,33 @@ def make_cookie_file(name=None):
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("# Netscape HTTP Cookie File\n" + body + "\n")
     return path
+
+
+def split_referers(text):
+    """The Referer setting may hold several website addresses (space / comma / new line separated)."""
+    return [x for x in re.split(r"[\s,]+", text or "") if x.lower().startswith("http")]
+
+
+def pick_referer(url, saved_text="", learned=None, timeout=12):
+    """Find which Referer this link's server accepts. Tries: remembered one for this host, none,
+    each address saved in Settings, then the link's own site. Returns (referer, worked)."""
+    import urllib.request
+    host = urlparse(url).netloc.lower()
+    cands = []
+    for c in [(learned or {}).get(host.replace(".", "|"))] + [""] + split_referers(saved_text) + [
+            f"{urlparse(url).scheme}://{host}/"]:
+        if c is not None and c not in cands:
+            cands.append(c)
+    for c in cands:
+        try:
+            req = urllib.request.Request(url, headers=_headers(c))
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                r.read(256)
+                if r.status < 400:
+                    return c, True
+        except Exception:
+            continue
+    return (split_referers(saved_text) or [""])[0], False
 
 
 def probe_url_sync(url, referer=""):
@@ -435,12 +463,12 @@ def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
             pct = (done * 100 / total) if total else 0
-            if not total and d.get("fragment_count"):
+            if d.get("fragment_count"):
                 pct = (d.get("fragment_index") or 0) * 100 / d["fragment_count"]
             on_progress(pct, d.get("speed"), d.get("eta"), done, total)
 
     opts = {"format": fmt, "outtmpl": os.path.join(outdir, "src.%(ext)s"), "merge_output_format": "mp4",
-            "noplaylist": True, "quiet": True, "no_warnings": True, "noprogress": True, "retries": 5, "fragment_retries": 10,
+            "noplaylist": True, "quiet": True, "no_warnings": True, "noprogress": True, "retries": 3, "fragment_retries": 3, "socket_timeout": 25,
             "concurrent_fragment_downloads": DL_CONCURRENCY, "logger": _SilentLogger(), "progress_hooks": [hook], "http_headers": _headers(referer)}
     if os.path.dirname(shutil.which(FFMPEG) or ""):
         opts["ffmpeg_location"] = os.path.dirname(shutil.which(FFMPEG))
