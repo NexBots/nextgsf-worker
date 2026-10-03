@@ -19,8 +19,10 @@ from utils import pipeline_core as pc
 
 logger = logging.getLogger(__name__)
 
-STAGE = {"prepare": "🔎 Preparing", "download": "⬇️ Downloading", "encode": "🎨 Adding watermark",
-         "split": "✂️ Splitting (file is over 2 GB)", "upload": "⬆️ Uploading", "queued": "⏳ Queued"}
+STAGE = {"prepare": "🔎 Preparing…", "download": "📥 Downloading file…", "encode": "🎨 Adding watermark…",
+         "convert": "🎧 Converting to MP3…", "split": "✂️ Splitting (file is over 2 GB)…",
+         "upload": "📤 Uploading to Telegram…", "queued": "⏳ Queued"}
+BRAND = os.getenv("BRAND_NAME") or "NexTGSF"
 
 
 class JobCancelled(Exception):
@@ -36,6 +38,7 @@ class Job:
         self.cancel = threading.Event()
         self.idx, self.total = 0, len(self.links)
         self.title, self.stage, self.pct, self.extra = "", "queued", 0.0, ""
+        self.t0, self.done_b, self.total_b, self.speed, self.eta, self.speed_txt = time.time(), 0, 0, None, None, ""
         self.ok, self.fail, self.notes, self.done = 0, [], [], False
 
     def to_doc(self):
@@ -68,10 +71,40 @@ async def save_cfg(users, uid, **kw):
 
 
 # ------------------------------------------------------------ progress
+def set_stage(job, stage):
+    job.stage, job.pct, job.extra = stage, 0.0, ""
+    job.t0, job.done_b, job.total_b, job.speed, job.eta, job.speed_txt = time.time(), 0, 0, None, None, ""
+
+
+def update_bytes(job, done, total):
+    """Upload-style progress: derive speed and ETA from bytes and elapsed time."""
+    el = max(time.time() - job.t0, 0.001)
+    job.done_b, job.total_b = done, total
+    job.pct = done * 100 / total if total else 0
+    job.speed = done / el
+    job.eta = (total - done) / job.speed if job.speed and total else None
+
+
+def update_media(job, pct, media_secs):
+    """Encode progress: 'speed' is how many seconds of video are processed per second (e.g. 1.8x)."""
+    el = max(time.time() - job.t0, 0.001)
+    job.pct = pct
+    job.speed_txt = f"{media_secs * pct / 100 / el:.1f}x"
+    job.eta = el * (100 - pct) / pct if pct > 1 else None
+
+
 def render_progress(job):
-    head = f"🎬 {job.idx}/{job.total}" + (f" · {job.title[:50]}" if job.title else "")
-    body = f"{STAGE.get(job.stage, job.stage)}\n{pc.bar(job.pct)} {job.pct:.0f}%"
-    return head + "\n" + body + (f"\n{job.extra}" if job.extra else "")
+    lines = [STAGE.get(job.stage, job.stage), "", f"{pc.bar(job.pct, 12)}  {job.pct:.2f}%", ""]
+    if job.total_b:
+        lines.append(f"📦 Size: {pc.fmt_size(job.done_b)} / {pc.fmt_size(job.total_b)}")
+    spd = job.speed_txt or (f"{pc.fmt_size(job.speed)}/s" if job.speed else "")
+    if spd or job.eta is not None:
+        lines.append(f"⚡ Speed: {spd or '--'}  |  ⏳ ETA: {pc.fmt_eta(job.eta)}")
+    if job.extra:
+        lines.append(job.extra)
+    lines += ["", f"🎬 {job.idx}/{job.total}" + (f" · {job.title[:45]}" if job.title else ""),
+              f"⚡ Powered by {BRAND}"]
+    return "\n".join(lines)
 
 
 async def progress_loop(job, ctx, every=4):
@@ -87,10 +120,12 @@ async def progress_loop(job, ctx, every=4):
 # ------------------------------------------------------------ one video
 async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb, wm_active):
     loop = asyncio.get_running_loop()
+    audio = job.quality.startswith("mp3:")
+    kbps = int(job.quality.split(":")[1]) if audio else 0
     workdir = os.path.join(pc.WORK_DIR, f"{job.uid}_{job.id}_{job.idx}")
     os.makedirs(workdir, exist_ok=True)
     try:
-        job.stage, job.pct, job.extra = "prepare", 0, ""
+        set_stage(job, "prepare")
         try:
             info = await loop.run_in_executor(None, pc.probe_url_sync, url, cfg["referer"])
         except Exception:
@@ -101,34 +136,33 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
         job.title = raw_title
 
         # ---- download
-        job.stage, job.pct = "download", 0
+        set_stage(job, "download")
 
-        def dl_cb(pct, speed, eta):
-            job.pct = pct
-            job.extra = f"{pc.fmt_size(speed)}/s · ETA {pc.fmt_eta(eta)}" if speed else ""
+        def dl_cb(pct, speed, eta, done=0, total=0):
+            job.pct, job.speed, job.eta, job.done_b, job.total_b = pct, speed, eta, done, total
 
         try:
-            path = await loop.run_in_executor(None, pc.download_sync, url, workdir, job.quality,
-                                              cfg["referer"], dl_cb, job.cancel)
+            path = await loop.run_in_executor(None, pc.download_sync, url, workdir,
+                                              "audio" if audio else job.quality, cfg["referer"], dl_cb, job.cancel)
         except Exception as e:
             if job.cancel.is_set():
                 raise JobCancelled()
             raise RuntimeError(str(e).replace("ERROR: ", "")[:200])
         meta = await pc.probe_file(path)
 
-        # ---- watermark
-        if wm_active:
+        # ---- watermark (not for audio)
+        if wm_active and not audio:
             img = pc.build_watermark_image(cfg["wm_mode"], cfg["wm_text"], logo,
                                            meta["width"] * cfg["wm_size"] / 100, cfg["wm_opacity"])
             if img is not None:
-                job.stage, job.pct, job.extra = "encode", 0, ""
+                set_stage(job, "encode")
                 wm_png = os.path.join(workdir, "wm.png")
                 img.save(wm_png)
                 x, y = pc.wm_xy(cfg["wm_pos"], meta["width"], meta["height"], img.width, img.height)
                 out = os.path.join(workdir, "wm_out.mp4")
                 try:
                     await pc.watermark_video(path, out, wm_png, x, y, meta["duration"],
-                                             lambda p: setattr(job, "pct", p), job.cancel)
+                                             lambda p: update_media(job, p, meta["duration"]), job.cancel)
                 except Exception:
                     if job.cancel.is_set():
                         raise JobCancelled()
@@ -138,6 +172,8 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
                 meta = await pc.probe_file(path)
         if job.cancel.is_set():
             raise JobCancelled()
+        if audio:
+            return await process_audio(job, ctx, cfg, n, url, raw_title, info, path, meta, kbps, custom_thumb, workdir)
 
         # ---- title / caption
         now = datetime.now()
@@ -156,7 +192,7 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
         # ---- thumbnail + split
         thumb = await pc.make_thumbnail(final_path, os.path.join(workdir, "thumb.jpg"), meta["duration"], custom_thumb)
         if os.path.getsize(final_path) > pc.MAX_TG_BYTES:
-            job.stage, job.pct, job.extra = "split", 0, ""
+            set_stage(job, "split")
             parts = await pc.split_video(final_path, workdir, meta["duration"], cancel_ev=job.cancel)
         else:
             parts = [final_path]
@@ -167,12 +203,11 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
                 raise JobCancelled()
             pm = meta if len(parts) == 1 else await pc.probe_file(part)
             cap = caption + (f"\n\n📦 Part {pi}/{len(parts)}" if len(parts) > 1 else "")
-            job.stage, job.pct = "upload", 0
-            job.extra = f"Part {pi}/{len(parts)}" if len(parts) > 1 else ""
+            set_stage(job, "upload")
+            job.extra = f"📦 Part {pi}/{len(parts)}" if len(parts) > 1 else ""
 
             def up_cb(cur, tot):
-                job.pct = cur * 100 / tot if tot else 0
-                job.extra = (f"Part {pi}/{len(parts)} · " if len(parts) > 1 else "") + f"{pc.fmt_size(cur)} / {pc.fmt_size(tot)}"
+                update_bytes(job, cur, tot)
                 if job.cancel.is_set():
                     ctx.client.stop_transmission()
 
@@ -195,6 +230,48 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
                         job.notes.append(note)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def process_audio(job, ctx, cfg, n, url, raw_title, info, src, meta, kbps, custom_thumb, workdir):
+    set_stage(job, "convert")
+    now = datetime.now()
+    vals = {"title": raw_title, "n": n, "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S"),
+            "duration": pc.fmt_duration(meta["duration"]), "res": f"MP3 {kbps}k", "source": info["source"],
+            "uploader": info["uploader"], "url": url, "yt": "", "yt_title": "", "slide": ""}
+    final_title = pc.render_template(cfg["title_tpl"], vals) or raw_title
+    filename = pc.sanitize_filename(final_title) + ".mp3"
+    out = os.path.join(workdir, filename)
+    await pc.to_mp3(src, out, kbps, meta["duration"], lambda p: update_media(job, p, meta["duration"]),
+                    job.cancel, final_title)
+    if job.cancel.is_set():
+        raise JobCancelled()
+    vals.update(title=final_title, filename=filename, filesize=pc.fmt_size(os.path.getsize(out)))
+    cap = pc.render_template(cfg["caption_tpl"], vals)[:1024]
+    thumb = None
+    if custom_thumb:
+        thumb = await pc.make_thumbnail(out, os.path.join(workdir, "thumb.jpg"), 0, custom_thumb)
+    job.title = final_title
+    set_stage(job, "upload")
+
+    def up_cb(cur, tot):
+        update_bytes(job, cur, tot)
+        if job.cancel.is_set():
+            ctx.client.stop_transmission()
+
+    try:
+        sent = await ctx.client.send_audio(job.chat_id, out, caption=cap, duration=int(meta["duration"]),
+                                           title=final_title[:64], file_name=filename, thumb=thumb, progress=up_cb)
+    except Exception as e:
+        if job.cancel.is_set():
+            raise JobCancelled()
+        raise RuntimeError(f"Upload failed: {str(e)[:150]}")
+    if cfg["fwd_chat"]:
+        try:
+            await ctx.client.send_audio(int(cfg["fwd_chat"]), sent.audio.file_id, caption=cap)
+        except Exception as e:
+            note = f"Auto-forward failed ({str(e)[:80]})"
+            if note not in job.notes:
+                job.notes.append(note)
 
 
 # ------------------------------------------------------------ a whole batch
@@ -241,6 +318,10 @@ async def run_job(job, ctx):
         text = f"🎉 Batch complete!\n✅ Sent: {job.ok}\n❌ Failed: {len(job.fail)}"
         for u, why in job.fail[:5]:
             text += f"\n• {u[:60]}… — {why}"
+        if any("403" in w or "orbidden" in w for _, w in job.fail):
+            text += ("\n\n💡 403 = the video server refuses the request. Open /settings → 🌐 Referer and "
+                     "send the address of the WEBSITE PAGE where this video plays (what a browser would send), "
+                     "then try the link again. If it still says 403, that server may only allow certain IPs.")
     for note in job.notes:
         text += f"\n⚠️ {note}"
     await ctx.edit(job, text, final=True)

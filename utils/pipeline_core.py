@@ -22,6 +22,7 @@ import yt_dlp
 FFMPEG = os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE = os.getenv("FFPROBE_PATH", "ffprobe")
 PRESET = os.getenv("FFMPEG_PRESET", "veryfast")
+DL_CONCURRENCY = max(1, min(32, int(os.getenv("DL_CONCURRENCY", "16"))))
 CRF = os.getenv("FFMPEG_CRF", "23")
 MAX_TG_BYTES = int(float(os.getenv("TG_MAX_MB", "1950")) * 1024 * 1024)
 
@@ -276,6 +277,14 @@ async def watermark_video(src, dst, wm_png, x, y, duration, on_progress=None, ca
         raise RuntimeError("ffmpeg watermark failed: " + err[-300:])
 
 
+async def to_mp3(src, dst, kbps, duration, on_progress=None, cancel_ev=None, title=""):
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", src, "-vn", "-c:a", "libmp3lame",
+           "-b:a", f"{int(kbps)}k", "-metadata", f"title={title[:100]}", "-progress", "pipe:1", "-nostats", dst]
+    rc, err = await run_ffmpeg(cmd, duration, on_progress, cancel_ev)
+    if rc != 0:
+        raise RuntimeError("ffmpeg mp3 failed: " + err[-300:])
+
+
 async def make_thumbnail(src, out_jpg, duration, custom_bytes=None):
     if custom_bytes:
         with open(out_jpg, "wb") as f:
@@ -389,16 +398,32 @@ def probe_url_sync(url, referer=""):
             os.remove(ck)
     if info.get("_type") == "playlist" and info.get("entries"):
         info = info["entries"][0]
-    heights = sorted({int(f["height"]) for f in info.get("formats", []) if f.get("height")}, reverse=True)
-    return {"title": info.get("title") or "", "duration": info.get("duration") or 0,
+    dur = info.get("duration") or 0
+    best = {}
+    for f in info.get("formats", []):
+        h = f.get("height")
+        if not h or f.get("vcodec") == "none":
+            continue
+        size, est = f.get("filesize") or f.get("filesize_approx"), False
+        if not size and f.get("tbr") and dur:
+            size, est = int(f["tbr"] * 1000 / 8 * dur), True       # bitrate x duration
+        cur = best.get(int(h))
+        if cur is None or (size or 0) > (cur["size"] or 0):
+            best[int(h)] = {"height": int(h), "width": f.get("width") or 0, "ext": f.get("ext") or "mp4",
+                            "size": size, "est": est or bool(f.get("filesize_approx"))}
+    formats = [best[h] for h in sorted(best, reverse=True)]
+    return {"title": info.get("title") or "", "duration": dur,
             "uploader": info.get("uploader") or info.get("channel") or "",
-            "source": source_name(url, info.get("extractor_key")), "heights": heights}
+            "source": source_name(url, info.get("extractor_key")), "heights": [f["height"] for f in formats],
+            "formats": formats}
 
 
 def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
     """Blocking download (run in a thread). Returns the path of the downloaded file."""
     if quality == "best":
         fmt = "bv*+ba/b"
+    elif quality == "audio":
+        fmt = "ba/b"
     else:
         h = int(quality)
         fmt = f"bv*[height<={h}]+ba/b[height<={h}]/b"
@@ -412,11 +437,11 @@ def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
             pct = (done * 100 / total) if total else 0
             if not total and d.get("fragment_count"):
                 pct = (d.get("fragment_index") or 0) * 100 / d["fragment_count"]
-            on_progress(pct, d.get("speed"), d.get("eta"))
+            on_progress(pct, d.get("speed"), d.get("eta"), done, total)
 
     opts = {"format": fmt, "outtmpl": os.path.join(outdir, "src.%(ext)s"), "merge_output_format": "mp4",
             "noplaylist": True, "quiet": True, "no_warnings": True, "noprogress": True, "retries": 5, "fragment_retries": 10,
-            "concurrent_fragment_downloads": 4, "logger": _SilentLogger(), "progress_hooks": [hook], "http_headers": _headers(referer)}
+            "concurrent_fragment_downloads": DL_CONCURRENCY, "logger": _SilentLogger(), "progress_hooks": [hook], "http_headers": _headers(referer)}
     if os.path.dirname(shutil.which(FFMPEG) or ""):
         opts["ffmpeg_location"] = os.path.dirname(shutil.which(FFMPEG))
     ck = make_cookie_file()
