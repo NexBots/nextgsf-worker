@@ -243,8 +243,9 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
             job.pct, job.speed, job.eta, job.done_b, job.total_b = pct, speed, eta, done, total
 
         try:
+            clip = tuple(o["clip"]) if o.get("clip") else None
             path = await run_cancellable(job, pc.download_sync, url, workdir,
-                                         "audio" if audio else job.quality, ref, dl_cb, job.cancel)
+                                         "audio" if audio else job.quality, ref, dl_cb, job.cancel, clip)
         except JobCancelled:
             raise
         except Exception as e:

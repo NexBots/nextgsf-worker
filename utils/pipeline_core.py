@@ -508,8 +508,59 @@ def probe_url_sync(url, referer=""):
             "formats": formats}
 
 
-def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
-    """Blocking download (run in a thread). Returns the path of the downloaded file."""
+def _to_seconds(tok):
+    tok = tok.strip().lower().replace(" ", "")
+    if not tok:
+        raise ValueError("empty time")
+    if ":" in tok:
+        parts = tok.split(":")
+        if len(parts) > 3 or not all(p.isdigit() for p in parts):
+            raise ValueError(tok)
+        sec = 0
+        for p in parts:
+            sec = sec * 60 + int(p)
+        return sec
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", tok)
+    if not m or not any(m.groups()):
+        raise ValueError(tok)
+    h, mi, s = (int(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def parse_clip(text, duration=0):
+    """'10:00-25:30', '1:05:00-1:20:00', '90-300' (seconds), '10:00-' (to the end), '10:00 to 25:30'.
+    Returns (start_seconds, end_seconds | None). Raises ValueError with a message for the user."""
+    t = (text or "").strip().lower().replace("–", "-").replace("—", "-")
+    t = re.sub(r"\s+(to|till|until)\s+", "-", t)
+    if t.count("-") != 1:
+        raise ValueError("Send it like `10:00-25:30` (start-end). Use `10:00-` to go till the end.")
+    a, b = t.split("-")
+    try:
+        start = _to_seconds(a) if a.strip() else 0
+        end = _to_seconds(b) if b.strip() else None
+    except ValueError:
+        raise ValueError("I could not read that time. Use mm:ss or h:mm:ss, e.g. `10:00-25:30`.")
+    if end is not None and end <= start:
+        raise ValueError("The end time must be after the start time.")
+    if duration and start >= duration:
+        raise ValueError(f"The start is after the end of the video (it is {fmt_duration(duration)} long).")
+    if duration and end is not None and end > duration:
+        end = None                      # past the end: just go till the end
+    if end is None and start == 0:
+        raise ValueError("That is the whole video - choose 🎞 Full video instead.")
+    return start, end
+
+
+def fmt_clip(clip):
+    if not clip:
+        return "Full video"
+    s, e = clip
+    return f"{fmt_duration(s)} → {fmt_duration(e) if e else 'end'}"
+
+
+def download_sync(url, outdir, quality, referer, on_progress, cancel_ev, clip=None):
+    """Blocking download (run in a thread). Returns the path of the downloaded file.
+    clip = (start_sec, end_sec | None) downloads only that part (needs ffmpeg)."""
     if quality == "best":
         fmt = "bv*+ba/b"
     elif quality == "audio":
@@ -534,6 +585,11 @@ def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
             "concurrent_fragment_downloads": DL_CONCURRENCY, "logger": _SilentLogger(), "progress_hooks": [hook], "http_headers": _headers(referer)}
     if os.path.dirname(shutil.which(FFMPEG) or ""):
         opts["ffmpeg_location"] = os.path.dirname(shutil.which(FFMPEG))
+    if clip:
+        cs, ce = clip
+        opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(float(cs), float(ce) if ce else float("inf"))])
+        if os.getenv("CLIP_ACCURATE", "") == "1":        # frame-accurate cuts, but re-encodes (slow on small servers)
+            opts["force_keyframes_at_cuts"] = True
     ck = make_cookie_file()
     if ck:
         opts["cookiefile"] = ck
@@ -543,11 +599,14 @@ def download_sync(url, outdir, quality, referer, on_progress, cancel_ev):
     finally:
         if ck and os.path.exists(ck):
             os.remove(ck)
-    files = [os.path.join(outdir, f) for f in os.listdir(outdir) if f.startswith("src.")
-             and not f.endswith((".part", ".ytdl"))]
+    files = [os.path.join(outdir, f) for f in os.listdir(outdir) if f.startswith("src")      # sections may add a suffix
+             and not f.endswith((".part", ".ytdl", ".json"))]
     if not files:
         raise RuntimeError("Download finished but no file was found")
-    return max(files, key=os.path.getsize)
+    best = max(files, key=os.path.getsize)
+    if clip and os.path.getsize(best) < 20_000:
+        raise RuntimeError("Could not cut that part from this link (the server does not allow seeking). Choose 🎞 Full video instead.")
+    return best
 
 
 def cleanup_stale(max_age_hours=24):
