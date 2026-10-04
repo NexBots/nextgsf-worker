@@ -49,6 +49,9 @@ DEFAULTS = {
     "fsets": [],               # forward sets: [{"name": str, "chats": [chat_id, ...]}]
     "yt_refresh": "",          # encrypted YouTube refresh token
     "yt_channel": "",
+    "gd_refresh": "",          # encrypted Google Drive refresh token
+    "gd_email": "",
+    "gd_folder": "",           # cached id of the upload folder in the user's Drive
 }
 
 PLACEHOLDERS = ["title", "n", "date", "time", "duration", "res", "source", "uploader",
@@ -398,26 +401,77 @@ def split_referers(text):
     return [x for x in re.split(r"[\s,]+", text or "") if x.lower().startswith("http")]
 
 
-def pick_referer(url, saved_text="", learned=None, timeout=12):
-    """Find which Referer this link's server accepts. Tries: remembered one for this host, none,
-    each address saved in Settings, then the link's own site. Returns (referer, worked)."""
+BUNNY_REFERERS = ["https://iframe.mediadelivery.net/", "https://player.mediadelivery.net/"]
+EXTRA_REFERERS = split_referers(os.getenv("EXTRA_REFERERS", ""))        # optional, owner-level (env only)
+
+
+def link_expiry(url):
+    """Unix time at which a signed link stops working (expires= / exp= ... in the query), or None."""
+    from urllib.parse import parse_qs
+    q = {k.lower(): v for k, v in parse_qs(urlparse(url).query).items()}
+    for k in ("expires", "expire", "exp", "e", "expiry", "expires_at"):
+        v = (q.get(k) or [""])[0]
+        if v.isdigit() and len(v) in (10, 13):
+            t = int(v)
+            return t // 1000 if len(v) == 13 else t
+    return None
+
+
+def _referer_ok(url, ref, timeout):
     import urllib.request
-    host = urlparse(url).netloc.lower()
-    cands = []
-    for c in [(learned or {}).get(host.replace(".", "|"))] + [""] + split_referers(saved_text) + [
-            f"{urlparse(url).scheme}://{host}/"]:
-        if c is not None and c not in cands:
-            cands.append(c)
-    for c in cands:
-        try:
-            req = urllib.request.Request(url, headers=_headers(c))
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                r.read(256)
-                if r.status < 400:
-                    return c, True
-        except Exception:
-            continue
-    return (split_referers(saved_text) or [""])[0], False
+    try:
+        req = urllib.request.Request(url, headers=_headers(ref))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(512)
+            if r.status >= 400:
+                return False
+            if ".m3u8" in url.lower() or "mpegurl" in (r.headers.get("Content-Type") or "").lower():
+                return b"#EXT" in body          # a real playlist, not a 200 error page
+            return True
+    except Exception:
+        return False
+
+
+def referer_candidates(url, saved_text="", learned=None):
+    """Everything worth trying, best first. No setup needed from the user."""
+    from urllib.parse import parse_qs
+    u = urlparse(url)
+    host = u.netloc.lower()
+    own = f"{u.scheme}://{host}/"
+    learned = learned or {}
+    raw = [learned.get(host.replace(".", "|")), "", own]
+    for k, v in parse_qs(u.query).items():                  # some links carry their site: ?referer=... / ?origin=...
+        if k.lower() in ("referer", "referrer", "ref", "origin", "site", "domain") and v:
+            val = v[0].strip()
+            raw.append(val if val.lower().startswith("http") else f"https://{val}/")
+    raw += split_referers(saved_text) + EXTRA_REFERERS
+    raw += [x for x in learned.values() if isinstance(x, str)]  # a site that worked before often owns several CDNs
+    if host.endswith("b-cdn.net") or host.endswith("mediadelivery.net"):
+        raw += BUNNY_REFERERS
+    parts = host.split(".")
+    if len(parts) > 2:
+        raw.append(f"{u.scheme}://{'.'.join(parts[-2:])}/")
+    out = []
+    for c in raw:
+        if c is not None and c not in out:
+            out.append(c)
+    return out
+
+
+def pick_referer(url, saved_text="", learned=None, timeout=10):
+    """Find which Referer this link's server accepts, like a browser would: all candidates are tried at the
+    same time and the best working one wins. Returns (referer, worked)."""
+    from concurrent.futures import ThreadPoolExecutor
+    cands = referer_candidates(url, saved_text, learned)
+    ex = ThreadPoolExecutor(max_workers=min(8, len(cands)))
+    try:
+        futs = [ex.submit(_referer_ok, url, c, timeout) for c in cands]
+        for c, f in zip(cands, futs):
+            if f.result():
+                return c, True
+    finally:
+        ex.shutdown(wait=False)
+    return "", False
 
 
 def probe_url_sync(url, referer=""):

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 STAGE = {"prepare": "🔎 Preparing…", "download": "📥 Downloading file…", "encode": "🎨 Adding watermark…",
          "convert": "🎧 Converting to MP3…", "split": "✂️ Splitting (file is over 2 GB)…",
-         "upload": "📤 Uploading to Telegram…", "yt": "▶️ Uploading to YouTube…", "queued": "⏳ Queued"}
+         "upload": "📤 Uploading to Telegram…", "yt": "▶️ Uploading to YouTube…", "gd": "☁️ Uploading to Google Drive…", "queued": "⏳ Queued"}
 BRAND = os.getenv("BRAND_NAME") or "NexTGSF"
 
 
@@ -42,6 +42,7 @@ class Job:
         self.title, self.stage, self.pct, self.extra = "", "queued", 0.0, ""
         self.t0, self.done_b, self.total_b, self.speed, self.eta, self.speed_txt = time.time(), 0, 0, None, None, ""
         self.ok, self.fail, self.notes, self.done = 0, [], [], False
+        self.start = time.time()
 
     def to_doc(self):
         return {"_id": self.id, "uid": self.uid, "chat_id": self.chat_id, "msg_id": self.msg_id,
@@ -104,8 +105,9 @@ def render_progress(job):
         lines.append(f"⚡ Speed: {spd or '--'}  |  ⏳ ETA: {pc.fmt_eta(job.eta)}")
     if job.extra:
         lines.append(job.extra)
+    el = int(time.time() - job.start)
     lines += ["", f"🎬 {job.idx}/{job.total}" + (f" · {job.title[:45]}" if job.title else ""),
-              f"⚡ Powered by {BRAND}"]
+              f"🕒 Total time: {el // 60}:{el % 60:02d}", f"⚡ Powered by {BRAND}"]
     return "\n".join(lines)
 
 
@@ -139,6 +141,30 @@ def fwd_targets(job, cfg):
     if mode == "custom":
         return [int(x) for x in (job.opts.get("fwd") or [])]
     return [int(cfg["fwd_chat"])] if cfg.get("fwd_chat") else []
+
+
+def gd_upload_sync(cfg, path, name, on_pct, cancel_ev):
+    """Blocking: upload to the user's connected Google Drive. Returns (file_id, link, folder_id)."""
+    from utils import gdrive_api as gd
+    from utils.encrypt import dcs
+    if not gd.configured():
+        raise RuntimeError("Google Drive is not set up on the server (YT_CLIENT_ID / YT_CLIENT_SECRET missing)")
+    if not cfg.get("gd_refresh"):
+        raise RuntimeError("Google Drive is not connected. Send /gdconnect first")
+    refresh = dcs(cfg["gd_refresh"])
+    get_token = lambda: gd.refresh_access_token(refresh)[0]          # noqa: E731
+    folder = cfg.get("gd_folder") or ""
+    if not folder:
+        folder = gd.ensure_folder(get_token())
+    try:
+        fid, link = gd.upload_file(get_token, path, name, folder, "video/mp4", on_progress=on_pct, cancel_ev=cancel_ev)
+    except gd.GDError as e:
+        if folder and getattr(e, "reason", "") == "notFound":      # cached folder was deleted: recreate once
+            folder = gd.ensure_folder(get_token())
+            fid, link = gd.upload_file(get_token, path, name, folder, "video/mp4", on_progress=on_pct, cancel_ev=cancel_ev)
+        else:
+            raise
+    return fid, link, folder
 
 
 async def forward_all(ctx, job, cfg, sent):
@@ -286,14 +312,30 @@ async def process_one(job, ctx, cfg, n, url, title_override, logo, custom_thumb,
             if ynote:
                 job.notes.append(ynote)
 
+        # ---- Google Drive (optional)
+        if dest in ("gd", "tg_gd"):
+            set_stage(job, "gd")
+
+            def gd_pct(pct):
+                job.pct = pct
+
+            fid, glink, gfolder = await run_cancellable(job, gd_upload_sync, cfg, final_path, filename, gd_pct, job.cancel)
+            if gfolder and gfolder != cfg.get("gd_folder"):
+                try:
+                    await ctx.set_cfg(job.uid, gd_folder=gfolder)
+                except Exception:
+                    pass
+            vals.update(gd=glink)
+            job.outputs.append(f"☁️ Google Drive: {glink}")
+
         caption_tpl = cfg["caption_tpl"]
         if vals["slide"] and "{slide}" not in caption_tpl:
             caption_tpl += "\n📎 Slide: {slide}"
         if vals["yt"] and "{yt}" not in caption_tpl:
             caption_tpl += "\n▶️ {yt}"
         caption = pc.render_template(caption_tpl, vals)
-        if dest == "yt":
-            return                                   # YouTube only: nothing to send to Telegram
+        if dest in ("yt", "gd"):
+            return                                   # no Telegram delivery for these destinations
 
         # ---- split
         if os.path.getsize(final_path) > pc.MAX_TG_BYTES:
@@ -368,6 +410,23 @@ async def process_audio(job, ctx, cfg, n, url, raw_title, info, src, meta, kbps,
 
 
 # ------------------------------------------------------------ a whole batch
+def friendly(why):
+    w = (why or "").lower()
+    if "expired" in w:
+        return "the link has expired, get a fresh link from the site"
+    if "403" in w or "forbidden" in w:
+        return "the server refused access (403) — usually an expired or site-locked link"
+    if "404" in w or "not found" in w:
+        return "the link does not exist any more (404)"
+    if "name resolution" in w or "timed out" in w or "timeout" in w or "connection" in w:
+        return "network problem, try again in a minute"
+    if "unsupported url" in w:
+        return "this site/link type is not supported"
+    if "ffmpeg" in w:
+        return "video conversion failed"
+    return why[:90]
+
+
 async def run_job(job, ctx):
     if job.cancel.is_set():
         await ctx.edit(job, "⏹ Cancelled.", final=True)
@@ -421,15 +480,15 @@ async def run_job(job, ctx):
     if cancelled:
         text = f"⏹ Cancelled. {job.ok} video(s) were already sent."
     else:
-        text = f"🎉 Task complete!\n✅ Done: {job.ok}\n❌ Failed: {len(job.fail)}"
+        el = int(time.time() - job.start)
+        text = (("🎉 All done!" if not job.fail else "⚠️ Finished with problems") + f"\n\n✅ Sent: {job.ok} video(s)"
+                + (f"\n❌ Failed: {len(job.fail)}" if job.fail else "") + f"\n🕒 Took: {el // 60}:{el % 60:02d}")
         for line in job.outputs:
             text += f"\n{line}"
         for u, why in job.fail[:5]:
-            text += f"\n• {u[:60]}… — {why}"
+            text += f"\n\n• {u[:50]}…\n  ↳ {friendly(why)}"
         if any("403" in w or "orbidden" in w for _, w in job.fail):
-            text += ("\n\n💡 403 = the video server refuses the request. Open /settings → 🌐 Referer and "
-                     "send the address of the WEBSITE PAGE where this video plays (what a browser would send), "
-                     "then try the link again. If it still says 403, that server may only allow certain IPs.")
+            text += "\n\n💡 403 usually means the link expired or is locked to one website. Get a fresh link from the site and try again."
     for note in job.notes:
         text += f"\n⚠️ {note}"
     await ctx.edit(job, text, final=True)

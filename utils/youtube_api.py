@@ -40,8 +40,8 @@ def _err(r):
 
 
 # ------------------------------------------------------------ OAuth (device flow)
-def device_start():
-    r = requests.post(f"{OAUTH}/device/code", data={"client_id": YT_CLIENT_ID, "scope": SCOPE}, timeout=TIMEOUT)
+def device_start(scope=None):
+    r = requests.post(f"{OAUTH}/device/code", data={"client_id": YT_CLIENT_ID, "scope": scope or SCOPE}, timeout=TIMEOUT)
     if r.status_code != 200:
         raise _err(r)
     return r.json()          # device_code, user_code, verification_url, expires_in, interval
