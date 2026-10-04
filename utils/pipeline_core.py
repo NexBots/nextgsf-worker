@@ -508,6 +508,50 @@ def probe_url_sync(url, referer=""):
             "formats": formats}
 
 
+_WRAP_KEYS = ("u", "url", "src", "source", "link", "target", "media", "file", "stream", "m3u8", "video", "play")
+
+
+def _decode_wrapped(v):
+    """A query value that is (or base64-encodes) an http(s) URL -> that URL, else None."""
+    v = (v or "").strip()
+    if re.match(r"https?://\S+$", v, re.I):
+        return v
+    if len(v) < 16 or not re.fullmatch(r"[A-Za-z0-9_\-+/=]+", v):
+        return None
+    for dec in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            s = dec(v + "=" * (-len(v) % 4)).decode("utf-8")
+        except Exception:
+            continue
+        if re.match(r"https?://[^\s]+$", s, re.I):
+            return s
+    return None
+
+
+def unwrap_url(url, depth=3):
+    """Many players/proxies carry the real media link inside the page link, e.g.
+    https://proxy.example/hls/ID?u=<base64 of https://cdn.example/video.m3u8>&t=...
+    Returns the inner link (up to `depth` levels), or the same url if there is none.
+    Only readable (plain / base64) values are unwrapped; encrypted ones are left as they are."""
+    from urllib.parse import parse_qs
+    for _ in range(depth):
+        if is_youtube(url):
+            break
+        q = parse_qs(urlparse(url).query)
+        inner = None
+        for k in _WRAP_KEYS:
+            for v in q.get(k, []):
+                inner = _decode_wrapped(v)
+                if inner:
+                    break
+            if inner:
+                break
+        if not inner or inner == url:
+            break
+        url = inner
+    return url
+
+
 def _to_seconds(tok):
     tok = tok.strip().lower().replace(" ", "")
     if not tok:
